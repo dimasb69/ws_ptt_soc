@@ -1,0 +1,776 @@
+/*
+// main.dart
+import 'dart:async';
+import 'dart:convert';
+import 'dart:typed_data';
+import 'package:flutter/foundation.dart'; // Para kDebugMode
+import 'package:flutter/material.dart';
+import 'package:web_socket_channel/web_socket_channel.dart';
+import 'package:uuid/uuid.dart';
+import 'package:flutter_sound/flutter_sound.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:just_audio/just_audio.dart' as ja;
+
+// Asegúrate de que esta ruta sea correcta
+import 'audio/byte_stream_audio_source.dart';
+
+void main() {
+  runApp(PTTApp());
+}
+
+class PTTApp extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      title: 'PTT Multiusuario',
+      theme: ThemeData(
+        primarySwatch: Colors.teal, // Puedes cambiar el color primario
+        useMaterial3: true,
+        brightness: Brightness.light, // O ThemeMode.system
+      ),
+      darkTheme: ThemeData(
+        primarySwatch: Colors.teal,
+        useMaterial3: true,
+        brightness: Brightness.dark,
+      ),
+      home: PTTHomePage(),
+    );
+  }
+}
+
+class PTTHomePage extends StatefulWidget {
+  @override
+  _PTTHomePageState createState() => _PTTHomePageState();
+}
+
+class _PTTHomePageState extends State<PTTHomePage> {
+  final _uuid = Uuid();
+  late String clientId;
+  String username = "";
+  List<String> servers = ["ws://192.168.100.26:8000/ws"]; // Tu URL de prueba
+  String? selectedServer;
+
+  WebSocketChannel? channel;
+  bool connected = false;
+  bool amITransmitting = false;
+  String? currentTransmitterId;
+  String? currentTransmitterName;
+
+  FlutterSoundRecorder? _recorder;
+  final ja.AudioPlayer _audioPlayer = ja.AudioPlayer();
+  StreamSubscription? _websocketSubscription;
+
+  StreamController<Uint8List>? _recordStreamController;
+  StreamController<Uint8List>? _playbackStreamController;
+
+  bool _isRecorderInitialized = false;
+
+  // Para logs de la UI
+  final List<String> _uiMessages = [];
+
+  @override
+  void initState() {
+    super.initState();
+    clientId = _uuid.v4();
+    if (servers.isNotEmpty) {
+      selectedServer = servers.first;
+    }
+    _recorder = FlutterSoundRecorder();
+
+    _initAudio();
+
+    // ---- LISTENERS DE DEBUG PARA JUST_AUDIO ----
+    _audioPlayer.playerStateStream.listen((state) {
+      if (!mounted) return;
+      _logToUIAndConsole("RECEPTOR ($clientId - $username) - PlayerState: playing=${state.playing}, processingState=${state.processingState}");
+      if (state.processingState == ja.ProcessingState.completed) {
+        _logToUIAndConsole("RECEPTOR ($clientId - $username) - Reproducción completada por just_audio.");
+      }
+    });
+
+    _audioPlayer.playbackEventStream.listen((event) {
+      // Muy verboso, descomentar solo si es necesario
+      // if (!mounted) return;
+      // _logToUIAndConsole("RECEPTOR ($clientId - $username) - PlaybackEvent: duration=${event.duration}, currentPosition=${event.updatePosition}");
+    }, onError: (Object e, StackTrace stackTrace) {
+      if (!mounted) return;
+      _logToUIAndConsole('RECEPTOR ERROR ($clientId - $username) - Error en playbackEventStream de just_audio: $e, Stack: $stackTrace');
+    });
+    // ---- FIN LISTENERS DE DEBUG ----
+  }
+
+  Future<void> _initAudio() async {
+    var micStatus = await Permission.microphone.request();
+    if (micStatus != PermissionStatus.granted) {
+      _showMessage("Permiso de micrófono denegado. PTT no funcionará.", isError: true);
+      return;
+    }
+
+    try {
+      await _recorder!.openRecorder();
+      if (mounted) {
+        setState(() {
+          _isRecorderInitialized = true;
+        });
+        _showMessage("Grabadora de audio lista.");
+      }
+    } catch (e) {
+      _showMessage("Error al inicializar grabadora: $e", isError: true);
+      if (mounted) {
+        setState(() {
+          _isRecorderInitialized = false;
+        });
+      }
+    }
+  }
+
+  @override
+  void dispose() {
+    _websocketSubscription?.cancel();
+    _recorder?.closeRecorder();
+    _audioPlayer.dispose();
+    _recordStreamController?.close();
+    _playbackStreamController?.close();
+    channel?.sink.close();
+    super.dispose();
+  }
+
+  void _connect() {
+    if (username.trim().isEmpty) {
+      _showMessage("Por favor ingresa un nombre de usuario.", isError: true);
+      return;
+    }
+    if (selectedServer == null || selectedServer!.isEmpty) {
+      _showMessage("Por favor selecciona o añade un servidor válido.", isError: true);
+      return;
+    }
+
+    final url = "$selectedServer/$clientId/$username";
+    _showMessage("Intentando conectar a: $url");
+
+    if (mounted) {
+      setState(() {
+        amITransmitting = false;
+        currentTransmitterId = null;
+        currentTransmitterName = null;
+        _uiMessages.clear(); // Limpiar logs de la UI al conectar
+      });
+    }
+    _logToUIAndConsole("CONEXION: URL: $url");
+
+
+    try {
+      channel = WebSocketChannel.connect(Uri.parse(url));
+      if (mounted) {
+        setState(() {
+          connected = true; // Indicar que se está intentando conectar
+        });
+      }
+      _showMessage("Conectando...");
+
+      _websocketSubscription = channel!.stream.listen((message) {
+        if (!mounted) return;
+        _handleServerMessage(message);
+      }, onDone: () {
+        if (!mounted) return;
+        _showMessage("Desconectado del servidor.", isError: true);
+        _logToUIAndConsole("CONEXION: WebSocket onDone (Desconectado).");
+        if (mounted) {
+          setState(() {
+            connected = false;
+            amITransmitting = false;
+            currentTransmitterId = null;
+            currentTransmitterName = null;
+          });
+        }
+        _stopAudioPlayback();
+      }, onError: (error) {
+        if (!mounted) return;
+        _showMessage("Error en conexión: $error", isError: true);
+        _logToUIAndConsole("CONEXION ERROR: WebSocket onError: $error");
+        if (mounted) {
+          setState(() {
+            connected = false;
+            amITransmitting = false;
+            currentTransmitterId = null;
+            currentTransmitterName = null;
+          });
+        }
+        _stopAudioPlayback();
+      });
+    } catch (e) {
+      _showMessage("Error al intentar conectar: $e", isError: true);
+      _logToUIAndConsole("CONEXION ERROR: Catch al conectar: $e");
+      if (mounted) {
+        setState(() {
+          connected = false;
+        });
+      }
+    }
+  }
+
+  void _disconnect() {
+    _logToUIAndConsole("CONEXION: Solicitando desconexión...");
+    channel?.sink.close();
+  }
+
+  void _handleServerMessage(dynamic message) async {
+    if (!mounted) return;
+    final String currentClientId = clientId; // Capturar para logs
+    final String currentUsername = username;
+
+    try {
+      final data = jsonDecode(message as String);
+      final type = data['type'] as String?;
+
+      _logToUIAndConsole("RECEPTOR ($currentClientId - $currentUsername): Mensaje WS: tipo='$type', data='$data'");
+
+      switch (type) {
+        case 'transmit_started':
+          final transmitterId = data['client_id'] as String?;
+          final transmitterUsername = data['username'] as String?;
+          _logToUIAndConsole("RECEPTOR ($currentClientId - $currentUsername): 'transmit_started' de '$transmitterUsername' ($transmitterId). Mi ID: $currentClientId");
+          if (mounted) {
+            setState(() {
+              currentTransmitterId = transmitterId;
+              currentTransmitterName = transmitterUsername ?? 'Desconocido';
+            });
+          }
+          if (currentTransmitterId != null && currentTransmitterId != currentClientId) {
+            _showMessage("${currentTransmitterName ?? 'Alguien'} está transmitiendo");
+            _logToUIAndConsole("RECEPTOR ($currentClientId - $currentUsername): Otro usuario ($currentTransmitterId) transmite. Iniciando playback.");
+            _startAudioPlayback();
+          } else if (currentTransmitterId == currentClientId) {
+            _logToUIAndConsole("RECEPTOR ($currentClientId - $currentUsername): Yo (${currentTransmitterId}) empecé a transmitir (según servidor).");
+          }
+          break;
+
+        case 'transmit_stopped':
+          final stopperId = data['client_id'] as String?;
+          final stopperUsername = data['username'] as String?;
+          _logToUIAndConsole("RECEPTOR ($currentClientId - $currentUsername): 'transmit_stopped' de '$stopperUsername' ($stopperId). Transmisor actual era: $currentTransmitterId");
+          _showMessage("Transmisión detenida (por ${stopperUsername ?? stopperId ?? 'alguien'})");
+          if (currentTransmitterId == stopperId || stopperId == null || stopperId == currentTransmitterId) { // Condición más inclusiva
+            if (mounted) {
+              setState(() {
+                currentTransmitterId = null;
+                currentTransmitterName = null;
+                if (stopperId == currentClientId) {
+                  amITransmitting = false;
+                  _logToUIAndConsole("RECEPTOR ($currentClientId - $currentUsername): Yo detuve la transmisión (confirmado por servidor). amITransmitting=false");
+                }
+              });
+            }
+            _stopAudioPlayback();
+          }
+          break;
+
+        case 'transmit_approved':
+          _logToUIAndConsole("RECEPTOR ($currentClientId - $currentUsername): 'transmit_approved' recibido.");
+          if (!connected) return;
+          _showMessage("Aprobado para transmitir. Iniciando grabación...");
+          if (mounted) {
+            setState(() {
+              amITransmitting = true;
+              currentTransmitterId = currentClientId; // Asumir que soy yo
+              currentTransmitterName = currentUsername;
+            });
+          }
+          await _startRecordingAndStreaming();
+          break;
+
+        case 'transmit_denied':
+          final reason = data['reason'] as String?;
+          _logToUIAndConsole("RECEPTOR ($currentClientId - $currentUsername): 'transmit_denied' recibido. Razón: $reason");
+          _showMessage("No puedes transmitir: ${reason ?? 'Razón desconocida'}", isError: true);
+          if (amITransmitting && mounted) {
+            setState(() {
+              amITransmitting = false;
+            });
+          }
+          break;
+
+        case 'audio_chunk':
+          final senderId = data['client_id'] as String?;
+          // _logToUIAndConsole("RECEPTOR ($currentClientId - $currentUsername): 'audio_chunk' de '$senderId'. currentTransmitterId='$currentTransmitterId'"); // Log muy verboso
+
+          if (senderId != null && senderId != currentClientId && currentTransmitterId == senderId) {
+            final base64Audio = data['data'] as String?;
+            if (base64Audio != null) {
+              try {
+                final bytes = base64Decode(base64Audio);
+                _logToUIAndConsole("RECEPTOR ($currentClientId - $currentUsername): Decodificado audio_chunk de '$senderId'. Tamaño bytes: ${bytes.length}. Alimentando a playback...");
+                _feedAudioToPlayback(bytes);
+              } catch (e) {
+                _logToUIAndConsole("RECEPTOR ERROR ($currentClientId - $currentUsername): Error decodificando audio_chunk: $e");
+              }
+            } else {
+              _logToUIAndConsole("RECEPTOR ($currentClientId - $currentUsername): audio_chunk de '$senderId' no contenía 'data' o era null.");
+            }
+          }
+          break;
+        case 'pong':
+          _logToUIAndConsole("RECEPTOR ($currentClientId - $currentUsername): 'pong' recibido del servidor.");
+          break;
+        default:
+          _logToUIAndConsole("RECEPTOR ($currentClientId - $currentUsername): Mensaje WS desconocido: tipo='$type', data='$data'");
+      }
+    } catch (e, s) {
+      _logToUIAndConsole("RECEPTOR ERROR ($currentClientId - $currentUsername): Error procesando mensaje WS: $e. Stack: $s. Mensaje original: $message");
+    }
+  }
+
+  void _toggleTransmitRequest() {
+    if (!connected) {
+      _showMessage("No estás conectado al servidor.", isError: true);
+      return;
+    }
+    if (!_isRecorderInitialized) {
+      _showMessage("La grabadora de audio no está lista.", isError: true);
+      return;
+    }
+
+    if (amITransmitting) {
+      _logToUIAndConsole("PTT_LOGIC ($clientId): Intentando detener mi transmisión.");
+      _stopMyTransmission();
+    } else {
+      if (currentTransmitterId != null && currentTransmitterId != clientId) {
+        _showMessage("${currentTransmitterName ?? 'Alguien'} ya está transmitiendo. Espera.", isError: true);
+        return;
+      }
+      _logToUIAndConsole("PTT_LOGIC ($clientId): Solicitando permiso para transmitir.");
+      _showMessage("Solicitando permiso para transmitir...");
+      channel?.sink.add(jsonEncode({"type": "request_transmit"}));
+    }
+  }
+
+  Future<void> _startRecordingAndStreaming() async {
+    if (!_isRecorderInitialized || !connected) return;
+    _logToUIAndConsole("GRABACION ($clientId): Iniciando _startRecordingAndStreaming. amITransmitting=$amITransmitting");
+
+    try {
+      if (_recorder!.isRecording) {
+        _logToUIAndConsole("GRABACION ($clientId): Grabadora ya estaba grabando, deteniendo primero.");
+        await _recorder!.stopRecorder();
+      }
+      if (_recordStreamController != null && !_recordStreamController!.isClosed) {
+        _logToUIAndConsole("GRABACION ($clientId): Cerrando _recordStreamController previo.");
+        await _recordStreamController!.close();
+      }
+      _recordStreamController = StreamController<Uint8List>.broadcast();
+      _logToUIAndConsole("GRABACION ($clientId): Nuevo _recordStreamController creado.");
+
+
+      _recordStreamController!.stream.listen(
+              (buffer) {
+            if (amITransmitting && channel != null && connected) {
+              final base64Data = base64Encode(buffer);
+              // _logToUIAndConsole("GRABACION ($clientId): Enviando audio_chunk. Tamaño buffer: ${buffer.length}, Base64 preview: ${base64Data.substring(0, (base64Data.length > 20 ? 20 : base64Data.length))}"); // Muy verboso
+              channel!.sink.add(jsonEncode({
+                "type": "audio_chunk",
+                "data": base64Data,
+              }));
+            }
+          },
+          onDone: () {
+            _logToUIAndConsole("GRABACION ($clientId): _recordStreamController onDone.");
+          },
+          onError: (e, s) {
+            _logToUIAndConsole("GRABACION ERROR ($clientId): Error en _recordStreamController.stream.listen: $e, Stack: $s");
+            _stopMyTransmission(force: true);
+          }
+      );
+
+      await _recorder!.startRecorder(
+        toStream: _recordStreamController!.sink,
+        codec: Codec.pcm16,
+        sampleRate: 16000,
+        numChannels: 1,
+      );
+      _logToUIAndConsole("GRABACION ($clientId): Grabadora iniciada y enviando al stream.");
+    } catch (e) {
+      _showMessage("Error al iniciar grabación: $e", isError: true);
+      _logToUIAndConsole("GRABACION ERROR ($clientId): Catch en _startRecordingAndStreaming: $e");
+      if (mounted) {
+        setState(() { amITransmitting = false; });
+      }
+    }
+  }
+
+  Future<void> _stopMyTransmission({bool force = false}) async {
+    if (!amITransmitting && !force) return;
+    _logToUIAndConsole("GRABACION ($clientId): Deteniendo mi transmisión (forzado=$force). amITransmitting=$amITransmitting");
+
+    if (mounted) {
+      setState(() {
+        amITransmitting = false;
+      });
+    }
+
+    if (_recorder != null && _recorder!.isRecording) {
+      try {
+        _logToUIAndConsole("GRABACION ($clientId): Deteniendo FlutterSoundRecorder.");
+        await _recorder!.stopRecorder();
+      } catch(e) { _logToUIAndConsole("GRABACION ERROR ($clientId): Error deteniendo recorder: $e");}
+    }
+    if (_recordStreamController != null && !_recordStreamController!.isClosed) {
+      _logToUIAndConsole("GRABACION ($clientId): Cerrando _recordStreamController.");
+      await _recordStreamController!.close();
+      _recordStreamController = null;
+    }
+
+    if (connected && channel != null) {
+      _logToUIAndConsole("GRABACION ($clientId): Enviando 'stop_transmit' al servidor.");
+      channel!.sink.add(jsonEncode({"type": "stop_transmit"}));
+    }
+  }
+
+  void _startAudioPlayback() {
+    final String currentPlaybackClientId = clientId; // Para logs dentro de closures
+    final String currentPlaybackUsername = username;
+
+    if (_audioPlayer.playing || (_playbackStreamController != null && !_playbackStreamController!.isClosed)) {
+      _logToUIAndConsole("REPRODUCCION ($currentPlaybackClientId - $currentPlaybackUsername): _startAudioPlayback - Ya reproduciendo o stream activo. Deteniendo actual (sin limpiar controller).");
+      _stopAudioPlayback(clearController: false);
+    }
+
+    if (_playbackStreamController == null || _playbackStreamController!.isClosed) {
+      _playbackStreamController = StreamController<Uint8List>.broadcast();
+      _logToUIAndConsole("REPRODUCCION ($currentPlaybackClientId - $currentPlaybackUsername): _startAudioPlayback - Nuevo _playbackStreamController creado.");
+    }
+
+    final String pcmContentType = 'application/octet-stream';
+    _logToUIAndConsole("REPRODUCCION ($currentPlaybackClientId - $currentPlaybackUsername): _startAudioPlayback - Configurando AudioSource con contentType: $pcmContentType");
+
+    final audioSource = ByteStreamAudioSource(
+        _playbackStreamController!,
+        contentType: pcmContentType,
+        tag: "PTTPlaybackStream-$currentPlaybackClientId"
+    );
+
+    _audioPlayer.setAudioSource(audioSource, preload: false).then((_) {
+      _logToUIAndConsole("REPRODUCCION ($currentPlaybackClientId - $currentPlaybackUsername): _startAudioPlayback - AudioSource configurado. Iniciando play().");
+      _audioPlayer.play();
+      _showMessage("Escuchando transmisión...");
+    }).catchError((error, stacktrace) {
+      _showMessage("Error al configurar fuente de audio para reproducción: $error", isError: true);
+      _logToUIAndConsole("REPRODUCCION ERROR ($currentPlaybackClientId - $currentPlaybackUsername): Error en setAudioSource: $error. Stack: $stacktrace");
+      _stopAudioPlayback();
+    });
+  }
+
+  void _feedAudioToPlayback(Uint8List audioData) {
+    if (_playbackStreamController != null && !_playbackStreamController!.isClosed &&
+        currentTransmitterId != null && currentTransmitterId != clientId) {
+      // _logToUIAndConsole("REPRODUCCION ($clientId): _feedAudioToPlayback - Añadiendo ${audioData.length} bytes al _playbackStreamController."); // Muy verboso
+      _playbackStreamController!.add(audioData);
+    }
+  }
+
+  void _stopAudioPlayback({bool clearController = true}) {
+    _logToUIAndConsole("REPRODUCCION ($clientId): Deteniendo _stopAudioPlayback (clearController=$clearController).");
+    _audioPlayer.stop();
+    if (clearController) {
+      _playbackStreamController?.close();
+      _playbackStreamController = null;
+      _logToUIAndConsole("REPRODUCCION ($clientId): _playbackStreamController cerrado y puesto a null.");
+    }
+  }
+
+  void _showMessage(String msg, {bool isError = false}) {
+    if (mounted) {
+      ScaffoldMessenger.of(context).removeCurrentSnackBar();
+      ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(msg),
+            duration: Duration(seconds: isError ? 4 : 2),
+            backgroundColor: isError ? Colors.red.shade700 : null,
+          )
+      );
+    }
+    // No llamar a _logToUIAndConsole aquí para evitar duplicados si ya se logueó
+    if (kDebugMode) {
+      print("${isError ? 'ERROR_MSG' : 'UI_MSG'}: $msg");
+    }
+  }
+
+  // Helper para logs
+  void _logToUIAndConsole(String message) {
+    if (mounted) {
+      setState(() {
+        _uiMessages.insert(0, "${TimeOfDay.now().format(context)} - $message"); // Añadir al inicio
+        if (_uiMessages.length > 100) { // Limitar el tamaño del log en UI
+          _uiMessages.removeLast();
+        }
+      });
+    }
+    if (kDebugMode) {
+      print(message);
+    }
+  }
+
+
+  void _addServer() {
+    showDialog(
+      context: context,
+      builder: (context) {
+        final controller = TextEditingController();
+        return AlertDialog(
+          title: Text("Agregar URL base del servidor"),
+          content: TextField(
+            controller: controller,
+            decoration: InputDecoration(hintText: "ws://ip_o_dominio:puerto/ws"),
+            keyboardType: TextInputType.url,
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                final url = controller.text.trim();
+                if (url.isNotEmpty && (url.startsWith("ws://") || url.startsWith("wss://"))) {
+                  if (!servers.contains(url)) {
+                    if (mounted) {
+                      setState(() {
+                        servers.add(url);
+                        selectedServer = url;
+                      });
+                    }
+                    _showMessage("Servidor '$url' añadido.");
+                  } else {
+                    _showMessage("Ese servidor ya existe en la lista.", isError: true);
+                  }
+                } else {
+                  _showMessage("URL inválida. Debe empezar con ws:// o wss://", isError: true);
+                }
+                Navigator.pop(context);
+              },
+              child: Text("Agregar"),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: Text("Cancelar"),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  void _removeServer(String url) {
+    if (servers.length <= 1 && servers.contains(url)) {
+      _showMessage("No puedes eliminar el único servidor. Añade otro primero o edita este.", isError: true);
+      return;
+    }
+    if (mounted) {
+      setState(() {
+        servers.remove(url);
+        if (selectedServer == url) {
+          selectedServer = servers.isNotEmpty ? servers.first : null;
+        }
+      });
+    }
+    _showMessage("Servidor '$url' eliminado.");
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    String pttButtonText;
+    Color pttButtonColor;
+    IconData pttIcon;
+    bool canRequestTransmit = connected && _isRecorderInitialized && (currentTransmitterId == null || currentTransmitterId == clientId);
+
+    if (amITransmitting) {
+      pttButtonText = "DEJAR DE TRANSMITIR";
+      pttButtonColor = Colors.redAccent.shade700;
+      pttIcon = Icons.mic_off_rounded;
+    } else if (currentTransmitterId != null && currentTransmitterId != clientId) {
+      pttButtonText = "${currentTransmitterName ?? 'Alguien'} HABLANDO...";
+      pttButtonColor = Colors.orangeAccent.shade700;
+      pttIcon = Icons.hearing_rounded;
+    } else if (connected && _isRecorderInitialized) {
+      pttButtonText = "PRESIONA PARA HABLAR";
+      pttButtonColor = Colors.green.shade700;
+      pttIcon = Icons.mic_rounded;
+    } else if (connected && !_isRecorderInitialized) {
+      pttButtonText = "INICIALIZANDO AUDIO...";
+      pttButtonColor = Colors.blueGrey.shade300;
+      pttIcon = Icons.mic_none_rounded;
+    } else {
+      pttButtonText = "CONÉCTATE PARA HABLAR";
+      pttButtonColor = Colors.grey.shade600;
+      pttIcon = Icons.mic_off_rounded;
+    }
+
+    return Scaffold(
+      appBar: AppBar(
+        title: Text("PTT App - ${username.isNotEmpty ? username : '(Sin Nombre)'}"),
+        actions: [
+          if (connected)
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16.0),
+              child: Center(child: Icon(Icons.cloud_done_rounded, color: Colors.greenAccent.shade700)),
+            )
+          else
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16.0),
+              child: Center(child: Icon(Icons.cloud_off_rounded, color: Colors.grey.shade600)),
+            )
+        ],
+      ),
+      body: Padding(
+        padding: EdgeInsets.fromLTRB(16,8,16,16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            if (!connected) ...[
+              TextField(
+                decoration: InputDecoration(labelText: "Tu Nombre de Usuario", border: OutlineInputBorder(), prefixIcon: Icon(Icons.person_outline)),
+                onChanged: (val) => username = val.trim(),
+                enabled: !connected,
+              ),
+              SizedBox(height: 8),
+              Text("Servidor Base (ej: ws://tu.servidor.com/ws):", style: Theme.of(context).textTheme.bodySmall),
+              Row(
+                children: [
+                  Expanded(
+                    child: DropdownButtonHideUnderline(
+                      child: Container(
+                        padding: EdgeInsets.symmetric(horizontal: 10.0, vertical: 4.0),
+                        decoration: BoxDecoration(
+                          borderRadius: BorderRadius.circular(8.0),
+                          border: Border.all(color: Theme.of(context).colorScheme.outline.withOpacity(0.7), width: 1),
+                        ),
+                        child: DropdownButton<String>(
+                          value: selectedServer,
+                          items: servers.isEmpty
+                              ? [DropdownMenuItem(value: null, enabled: false, child: Text("Añade un servidor", style: TextStyle(color: Colors.grey)))]
+                              : servers.map((s) => DropdownMenuItem(
+                            value: s,
+                            child: Row(
+                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                              children: [
+                                Flexible(child: Text(s, overflow: TextOverflow.ellipsis)),
+                                if (!(connected && servers.length == 1 && selectedServer == s))
+                                  IconButton(
+                                    icon: Icon(Icons.delete_outline_rounded, color: Colors.red.shade400, size: 20),
+                                    onPressed: () => _removeServer(s),
+                                    padding: EdgeInsets.zero,
+                                    constraints: BoxConstraints(),
+                                    splashRadius: 20,
+                                  )
+                              ],
+                            ),
+                          )).toList(),
+                          onChanged: connected ? null : (val) {
+                            if (mounted) setState(() { selectedServer = val; });
+                          },
+                          isExpanded: true,
+                          hint: Text("Selecciona o añade servidor"),
+                          underline: SizedBox.shrink(),
+                          borderRadius: BorderRadius.circular(8.0),
+                        ),
+                      ),
+                    ),
+                  ),
+                  IconButton(
+                    icon: Icon(Icons.add_circle_outline_rounded, color: Theme.of(context).colorScheme.primary),
+                    tooltip: "Añadir nuevo servidor",
+                    onPressed: connected ? null : _addServer,
+                  )
+                ],
+              ),
+              SizedBox(height: 12),
+              ElevatedButton.icon(
+                icon: Icon(Icons.cloud_upload_outlined),
+                onPressed: (username.trim().isNotEmpty && selectedServer != null && _isRecorderInitialized) ? _connect : null,
+                label: Text("Conectar"),
+                style: ElevatedButton.styleFrom(padding: EdgeInsets.symmetric(vertical: 14)),
+              ),
+              SizedBox(height: 10),
+            ],
+            if (connected) ...[
+              ElevatedButton.icon(
+                icon: Icon(Icons.cloud_off_outlined),
+                onPressed: _disconnect,
+                label: Text("Desconectar del Servidor"),
+                style: ElevatedButton.styleFrom(backgroundColor: Colors.blueGrey.shade700, foregroundColor: Colors.white, padding: EdgeInsets.symmetric(vertical: 14)),
+              ),
+              SizedBox(height: 12),
+            ],
+            Text(
+              connected ? "Conectado: $username" : "Estado: No conectado",
+              textAlign: TextAlign.center,
+              style: TextStyle(fontWeight: connected ? FontWeight.bold : FontWeight.normal, fontSize: 16),
+            ),
+            if (connected && selectedServer != null) Text("Servidor: $selectedServer", textAlign: TextAlign.center, style: TextStyle(fontSize: 11, color: Colors.grey.shade600)),
+            SizedBox(height: 15),
+            Expanded(
+              flex: 3, // Dar más espacio al botón PTT
+              child: Center(
+                child: GestureDetector(
+                  onTapDown: (_) { if (canRequestTransmit && !amITransmitting) _toggleTransmitRequest(); },
+                  onTapUp: (_) { if (amITransmitting) _toggleTransmitRequest(); },
+                  onLongPressStart: (_) { if (canRequestTransmit && !amITransmitting) _toggleTransmitRequest(); },
+                  onLongPressEnd: (_) { if (amITransmitting) _toggleTransmitRequest(); },
+                  onLongPressCancel: () { if (amITransmitting) _toggleTransmitRequest(); },
+                  child: AnimatedContainer(
+                    duration: Duration(milliseconds: 150),
+                    padding: EdgeInsets.all(25), // Ajustar padding
+                    decoration: BoxDecoration(
+                        color: pttButtonColor,
+                        shape: BoxShape.circle,
+                        boxShadow: [
+                          BoxShadow(
+                            color: Colors.black.withOpacity(amITransmitting ? 0.35 : 0.15),
+                            blurRadius: amITransmitting ? 12 : 6,
+                            spreadRadius: amITransmitting ? 3 : 1,
+                          )
+                        ]
+                    ),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(pttIcon, color: Colors.white, size: 60), // Icono más grande
+                        SizedBox(height: 8),
+                        Text(
+                          pttButtonText,
+                          style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 11),
+                          textAlign: TextAlign.center,
+                        )
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            SizedBox(height: 10),
+            // --- Área de Logs de la UI ---
+            Text("Logs de Eventos:", style: Theme.of(context).textTheme.bodySmall),
+            Expanded(
+              flex: 2, // Espacio para los logs
+              child: Container(
+                margin: const EdgeInsets.only(top: 4.0),
+                decoration: BoxDecoration(
+                  border: Border.all(color: Colors.grey.shade400),
+                  borderRadius: BorderRadius.circular(4),
+                  color: Theme.of(context).colorScheme.surfaceVariant.withOpacity(0.2),
+                ),
+                child: ListView.builder(
+                  reverse: true, // Mostrar los más recientes primero
+                  itemCount: _uiMessages.length,
+                  itemBuilder: (context, index) {
+                    return Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 6.0, vertical: 2.0),
+                      child: Text(_uiMessages[index], style: TextStyle(fontSize: 9.5)),
+                    );
+                  },
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+*/
