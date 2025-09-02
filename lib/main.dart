@@ -9,7 +9,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show rootBundle;
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:uuid/uuid.dart';
-import'package:permission_handler/permission_handler.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:http/http.dart' as http;
 
@@ -30,7 +30,7 @@ class PTTApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
-      title: 'PTT - Paso 2 Rev (UI Fix)',
+      title: 'PTT - Paso 2 Rev (Busy/Ready)',
       theme: ThemeData(primarySwatch: Colors.teal, useMaterial3: true, brightness: Brightness.light),
       darkTheme: ThemeData(primarySwatch: Colors.teal, useMaterial3: true, brightness: Brightness.dark),
       home: PTTHomePage(),
@@ -88,12 +88,9 @@ class _PTTHomePageState extends State<PTTHomePage> {
   bool _isAudioHandlerServiceReady = false;
 
   ReceivedAudioMessage? _lastReceivedMessageForAutoPlay;
-
   String? _receiverTempDirectoryPath;
-
   bool _isAudioMessageCurrentlyPlaying = false;
   String? _idOfMessageCurrentlyPlaying;
-  // Para saber si el audio que se está reproduciendo ha terminado y poder resetear el icono del botón PTT
   bool _currentPlaybackFinishedOrError = true;
 
   String get _logPrefix => "[${clientId.substring(0,5)} (${username.isNotEmpty ? username.substring(0,min(username.length,3)) : 'USR'})]";
@@ -103,7 +100,6 @@ class _PTTHomePageState extends State<PTTHomePage> {
     super.initState();
     clientId = _uuid.v4();
     if (servers.isNotEmpty) selectedServer = servers.first;
-
     _audioHandlerService = AudioHandlerService();
     _audioHandlerService.setClientIdForLogs(clientId);
     _initPermissionsAndAudio();
@@ -111,19 +107,15 @@ class _PTTHomePageState extends State<PTTHomePage> {
   }
 
   Future<void> _initPermissionsAndAudio() async {
-    if (kDebugMode) print("$_logPrefix UI_FIX: Inicializando permisos y audio...");
+    if (kDebugMode) print("$_logPrefix BUSY_READY: Init permissions & audio...");
     var micStatus = await Permission.microphone.request();
     _isMicPermissionGranted = micStatus == PermissionStatus.granted;
-
     await _audioHandlerService.initAudio();
-
-    if (mounted) {
-      setState(() { _isAudioHandlerServiceReady = true; });
-    }
+    if (mounted) setState(() { _isAudioHandlerServiceReady = true; });
     if (kDebugMode) {
-      if (_isMicPermissionGranted) { print("$_logPrefix UI_FIX: Permiso de micrófono CONCEDIDO."); }
-      else { print("$_logPrefix UI_FIX: Permiso de micrófono DENEGADO."); _showMessage("Permiso de Micrófono Denegado.", isError: true); }
-      print("$_logPrefix UI_FIX: AudioHandlerService listo.");
+      if (_isMicPermissionGranted) print("$_logPrefix BUSY_READY: Mic permission GRANTED.");
+      else { print("$_logPrefix BUSY_READY: Mic permission DENIED."); _showMessage("Permiso Mic Denegado.", isError: true); }
+      print("$_logPrefix BUSY_READY: AudioHandlerService ready.");
     }
   }
 
@@ -135,14 +127,12 @@ class _PTTHomePageState extends State<PTTHomePage> {
   }
 
   Future<void> _playLocalBeepInicio() async {
-    if (_isAudioMessageCurrentlyPlaying) return;
-    if (!_isAudioHandlerServiceReady || !mounted) return;
+    if (_isAudioMessageCurrentlyPlaying || !_isAudioHandlerServiceReady || !mounted) return;
     await _audioHandlerService.playBeep('assets/beep2.wav', 'LocalBeepInicio');
   }
 
   Future<void> _playLocalBeepFin() async {
-    if (_isAudioMessageCurrentlyPlaying) return;
-    if (!_isAudioHandlerServiceReady || !mounted) return;
+    if (_isAudioMessageCurrentlyPlaying || !_isAudioHandlerServiceReady || !mounted) return;
     await _audioHandlerService.playBeep('assets/bepbep2.wav', 'LocalBeepFin');
   }
 
@@ -269,10 +259,23 @@ class _PTTHomePageState extends State<PTTHomePage> {
           final mId = data['message_id'] as String?; final scId = data['sender_client_id'] as String?;
           final suName = data['sender_username'] as String?; final fName = data['filename'] as String?;
           final audioUrl = buildAudioDownloadUrl(selectedServerUrl: selectedServer, messageId: mId, filenameFromServer: fName);
+
           if (mId != null && scId != null && suName != null && fName != null && audioUrl != null && scId != clientId) {
             final newMsg = ReceivedAudioMessage(id: mId, senderUsername: suName, filename: fName, url: audioUrl);
             if (mounted) {
-              setState(() { _lastReceivedMessageForAutoPlay = newMsg; _currentPlaybackFinishedOrError = false; }); // Preparar para reproducir
+              if (_isAudioMessageCurrentlyPlaying && _idOfMessageCurrentlyPlaying != newMsg.id) {
+                if (kDebugMode) print("$_logPrefix MSG_AUDIO_RECV: Interrumpiendo reproducción actual (${_idOfMessageCurrentlyPlaying ?? 'N/A'}) por nuevo mensaje ${newMsg.id}.");
+                await _audioHandlerService.stopCurrentMessagePlayback();
+                setState(() {
+                  if (_lastReceivedMessageForAutoPlay?.id == _idOfMessageCurrentlyPlaying) {
+                    if (_lastReceivedMessageForAutoPlay != null) _lastReceivedMessageForAutoPlay!.isPlaying = false;
+                  }
+                  _isAudioMessageCurrentlyPlaying = false; _idOfMessageCurrentlyPlaying = null;
+                  _currentPlaybackFinishedOrError = true;
+                });
+                await Future.delayed(Duration(milliseconds: 150));
+              }
+              setState(() { _lastReceivedMessageForAutoPlay = newMsg; _currentPlaybackFinishedOrError = false; });
               if (_lastReceivedMessageForAutoPlay != null) {
                 _showMessage("Audio de $suName. Reproduciendo...", durationSeconds: 2);
                 _downloadAndPlayReceivedAudio(_lastReceivedMessageForAutoPlay!);
@@ -308,17 +311,21 @@ class _PTTHomePageState extends State<PTTHomePage> {
   }
 
   Future<void> _downloadAndPlayReceivedAudio(ReceivedAudioMessage msgToPlay) async {
-    if (_receiverTempDirectoryPath == null) { _showMessage("Directorio no listo.", isError: true); setState(()=> _currentPlaybackFinishedOrError = true); return; }
+    if (_receiverTempDirectoryPath == null) {
+      _showMessage("Directorio no listo.", isError: true);
+      if (mounted) setState(()=> _currentPlaybackFinishedOrError = true);
+      return;
+    }
 
-    // Si se llama a reproducir mientras ya está sonando este mismo mensaje, AudioHandler lo detendrá.
-    // Si es otro mensaje, AudioHandler también detendrá el anterior antes de reproducir el nuevo.
-    // Aquí solo gestionamos el estado de la UI
+    if (connected && channel != null) {
+      channel!.sink.add(jsonEncode({ "type": "receiver_busy", "client_id": clientId, "message_id": msgToPlay.id }));
+      if (kDebugMode) print("$_logPrefix NET: Enviado 'receiver_busy' para msg ${msgToPlay.id}");
+    }
 
     if(mounted) setState(() {
       msgToPlay.isDownloading = true; msgToPlay.hasError = false;
-      _isAudioMessageCurrentlyPlaying = true; // Indicar que un proceso de reproducción ha comenzado
-      _idOfMessageCurrentlyPlaying = msgToPlay.id;
-      _currentPlaybackFinishedOrError = false; // Resetear
+      _isAudioMessageCurrentlyPlaying = true; _idOfMessageCurrentlyPlaying = msgToPlay.id;
+      _currentPlaybackFinishedOrError = false;
     });
 
     String localFileName = generateLocalFilenameForDownload(messageId: msgToPlay.id, originalFilename: msgToPlay.filename, tempFilenameBase: _tempAudioFilenameReceiverBase);
@@ -330,10 +337,11 @@ class _PTTHomePageState extends State<PTTHomePage> {
         final File file = File(localFilePath);
         await file.writeAsBytes(response.bodyBytes);
         if(mounted) setState(() => msgToPlay.localPath = localFilePath );
-        if (!mounted) { setState(()=> _currentPlaybackFinishedOrError = true); return; }
+        if (!mounted) {
+          if (connected && channel != null) channel!.sink.add(jsonEncode({"type": "receiver_ready", "client_id": clientId, "message_id": msgToPlay.id, "status": "aborted_not_mounted"}));
+          if (mounted) setState(()=> _currentPlaybackFinishedOrError = true); return;
+        }
 
-        // El estado _isAudioMessageCurrentlyPlaying y _idOfMessageCurrentlyPlaying ya están seteados
-        // Solo necesitamos que el message object tenga isPlaying = true
         if(mounted) setState(() => msgToPlay.isPlaying = true);
 
         await _audioHandlerService.playAudioFile( localFilePath, msgToPlay.id,
@@ -359,9 +367,20 @@ class _PTTHomePageState extends State<PTTHomePage> {
       } else { throw Exception('Fallo al descargar: ${response.statusCode}'); }
     } catch (e) {
       _showMessage("Error al descargar: $e", isError: true);
-      if (mounted) { setState(() { msgToPlay.hasError = true; _currentPlaybackFinishedOrError = true; if(_idOfMessageCurrentlyPlaying == msgToPlay.id){_isAudioMessageCurrentlyPlaying = false; _idOfMessageCurrentlyPlaying = null;} }); }
+      if (mounted) {
+        setState(() {
+          msgToPlay.hasError = true; _currentPlaybackFinishedOrError = true;
+          if(_idOfMessageCurrentlyPlaying == msgToPlay.id){_isAudioMessageCurrentlyPlaying = false; _idOfMessageCurrentlyPlaying = null;}
+        });
+      }
     } finally {
-      if (mounted) setState(() => msgToPlay.isDownloading = false);
+      if (mounted) {
+        setState(() => msgToPlay.isDownloading = false);
+      }
+      if (connected && channel != null) {
+        channel!.sink.add(jsonEncode({ "type": "receiver_ready", "client_id": clientId, "message_id": msgToPlay.id, "status": msgToPlay.hasError ? "error" : (msgToPlay.isPlaying ? "playing_interrupted" : "completed") }));
+        if (kDebugMode) print("$_logPrefix NET: Enviado 'receiver_ready' para msg ${msgToPlay.id}, status: ${msgToPlay.hasError ? "error" : (msgToPlay.isPlaying ? "playing_interrupted" : "completed")}");
+      }
     }
   }
 
@@ -391,18 +410,13 @@ class _PTTHomePageState extends State<PTTHomePage> {
       }
     }
 
-    // --- PTT Button Logic ---
-    if (!connected) { /* No PTT button logic */ }
+    if (!connected) { /* No PTT button */ }
     else if (!_isMicPermissionGranted && kReleaseMode) { pttButtonText = "PERMISO MIC"; pttIcon = Icons.mic_off_rounded; pttButtonColor = Colors.red.shade300; }
     else if (!audioSystemReady) { pttButtonText = "AUDIO NO LISTO"; pttIcon = Icons.volume_off_rounded; pttButtonColor = Colors.blueGrey.shade300; }
     else {
       if (_isAudioMessageCurrentlyPlaying && _idOfMessageCurrentlyPlaying != null && !_currentPlaybackFinishedOrError) {
-        // Si un audio se está reproduciendo activamente (y no ha terminado/error)
-        pttButtonText = "REPRODUCIENDO...";
-        // Cambiar icono a un círculo simple o icono de "no tocar"
-        pttIcon = Icons.play_circle_fill_rounded; // O usa Icons.circle si quieres un círculo simple
-        pttButtonColor = Colors.purple.shade300; // Un color que indique que está ocupado y no es PTT
-        pttButtonEnabled = false; // No se puede interactuar como PTT
+        pttButtonText = "REPRODUCIENDO..."; pttIcon = Icons.play_circle_fill_rounded;
+        pttButtonColor = Colors.purple.shade300; pttButtonEnabled = false;
       }
       else if (_currentGlobalTransmitterId != null && _currentGlobalTransmitterId != clientId) {
         pttButtonText = "${_currentGlobalTransmitterName ?? 'Alguien'} HABLA"; pttIcon = Icons.hearing_rounded;
@@ -418,7 +432,7 @@ class _PTTHomePageState extends State<PTTHomePage> {
     }
 
     return Scaffold(
-      appBar: AppBar(title: Text("PTT - Streamlined ${username.isNotEmpty ? '($username)' : ''}")),
+      appBar: AppBar(title: Text("PTT - Busy/Ready ${username.isNotEmpty ? '($username)' : ''}")),
       body: Padding(
         padding: const EdgeInsets.all(16.0),
         child: Column(
@@ -435,12 +449,11 @@ class _PTTHomePageState extends State<PTTHomePage> {
               SizedBox(height: 8), ElevatedButton.icon( icon: Icon(Icons.logout_rounded), onPressed: _disconnect, label: Text("DESCONECTAR"), style: ElevatedButton.styleFrom(backgroundColor: Colors.blueGrey, padding: EdgeInsets.symmetric(vertical: 10)) ),
             ],
             Divider(height: 20, thickness: 1),
-            // El Expanded ahora contiene un Column que centrará el botón PTT
             Expanded(
               child: connected
                   ? Column(
-                mainAxisAlignment: MainAxisAlignment.center, // Centra el botón verticalmente
-                crossAxisAlignment: CrossAxisAlignment.center, // Centra el botón horizontalmente
+                mainAxisAlignment: MainAxisAlignment.center,
+                crossAxisAlignment: CrossAxisAlignment.center,
                 children: [
                   GestureDetector(
                     onTapDown: pttButtonEnabled ? (_) => _onPttPress() : null,
@@ -450,15 +463,15 @@ class _PTTHomePageState extends State<PTTHomePage> {
                     onLongPressCancel: pttButtonEnabled ? () => _onPttRelease() : null,
                     child: AnimatedContainer(
                         duration: Duration(milliseconds: 150),
-                        padding: EdgeInsets.all(25), // Aumentar padding para hacerlo más grande
-                        constraints: BoxConstraints(minWidth: 140, minHeight: 140, maxWidth: 180, maxHeight: 180), // Ajustar tamaño
+                        padding: EdgeInsets.all(25),
+                        constraints: BoxConstraints(minWidth: 140, minHeight: 140, maxWidth: 180, maxHeight: 180),
                         decoration: BoxDecoration(
                           color: pttButtonColor, shape: BoxShape.circle,
-                          boxShadow: [ if(pttButtonEnabled && !( _isAudioMessageCurrentlyPlaying && !_currentPlaybackFinishedOrError ) ) // No sombra si es el ícono de reproducción
+                          boxShadow: [ if(pttButtonEnabled && !( _isAudioMessageCurrentlyPlaying && !_currentPlaybackFinishedOrError ) )
                             BoxShadow(color: pttButtonColor.withOpacity(0.5), blurRadius: 10, spreadRadius: 3)
                           ],
                           border: _isAudioMessageCurrentlyPlaying && !_currentPlaybackFinishedOrError
-                              ? Border.all(color: Colors.white54, width: 2) // Borde para el icono de reproducción
+                              ? Border.all(color: Colors.white54, width: 2)
                               : null,
                         ),
                         child: Column( mainAxisSize: MainAxisSize.min, mainAxisAlignment: MainAxisAlignment.center,
@@ -466,7 +479,6 @@ class _PTTHomePageState extends State<PTTHomePage> {
                         )
                     ),
                   ),
-                  // Indicador de "Error al reproducir" se puede mostrar aquí si es necesario
                   if (_lastReceivedMessageForAutoPlay != null && _lastReceivedMessageForAutoPlay!.hasError && _currentPlaybackFinishedOrError)
                     Padding(
                       padding: const EdgeInsets.only(top: 20.0),
@@ -482,4 +494,3 @@ class _PTTHomePageState extends State<PTTHomePage> {
     );
   }
 }
-
