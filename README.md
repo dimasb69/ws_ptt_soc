@@ -1,16 +1,11 @@
 # ppt_app
 
-A new Flutter project.
+PTT Flutter web Socket App
 
-## Getting Started
+La UI es simple y el desarrollo se centro en la funcionalidad de la app
 
-This project is a starting point for a Flutter application.
+El proyecto utiliza FVM para manejo de version de Flutter revisar el .fvmrc y recuerda que todos los comandos flutter deben usar fvm como cabecera ejemplo: fvm flutter pub get
 
-A few resources to get you started if this is your first Flutter project:
+Dentro del zip ptt_websocket esta el script del server en Python donde se conectara la App,  al crear la app debe tener acceso a la red donde esta el websocket y colocar la configuracion del servidor antes de conectar! 
 
-- [Lab: Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Cookbook: Useful Flutter samples](https://docs.flutter.dev/cookbook)
-
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+ejemplo de servidor:  ws://[IP del WebSocket]:8000/ws

@@ -15,7 +15,8 @@ import 'package:http/http.dart' as http;
 import 'package:another_audio_recorder/another_audio_recorder.dart';
 
 import 'audio_handler.dart';
-import 'utils.dart';
+import 'config/app_theme.dart';
+import 'utils/app_utils.dart';
 
 const String _anotherRecorderTempFilename = "ptt_audio_record";
 const AudioFormat _anotherRecorderAudioFormat = AudioFormat.AAC;
@@ -33,9 +34,10 @@ class PTTApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
-      title: 'PTT App',
-      theme: ThemeData(primarySwatch: Colors.teal, useMaterial3: true, brightness: Brightness.light),
-      darkTheme: ThemeData(primarySwatch: Colors.teal, useMaterial3: true, brightness: Brightness.dark),
+      title: 'W-S PTT PoC',
+      theme: getAppTheme(),
+      darkTheme: getAppTheme(),
+      themeMode: ThemeMode.dark,
       home: PTTHomePage(),
     );
   }
@@ -75,6 +77,7 @@ class _PTTHomePageState extends State<PTTHomePage> {
   late String clientId;
 
   String username = "";
+  final TextEditingController _usernameController = TextEditingController();
   List<String> servers = ["ws://192.168.100.26:8000/ws"];
   String? selectedServer;
 
@@ -105,9 +108,25 @@ class _PTTHomePageState extends State<PTTHomePage> {
   void initState() {
     super.initState();
     clientId = _uuid.v4();
+    _usernameController.text = username;
+
     if (servers.isNotEmpty) selectedServer = servers.first;
     _audioHandlerService = AudioHandlerService();
     _initPermissionsAndAudio();
+  }
+
+  @override
+  void dispose() {
+    _usernameController.dispose();
+    if (_audioRecorderInstance != null && _currentRecorderStatus == RecordingStatus.Recording ) {
+      _audioRecorderInstance!.stop().catchError((e){ if (kDebugMode) print("WARN: Error deteniendo AAR en dispose: $e");});
+    }
+    _audioRecorderInstance = null;
+    _audioHandlerService.stopCurrentMessagePlayback();
+    _websocketSubscription?.cancel();
+    if(channel != null) { channel!.sink.close().catchError((e){/* ignorar */}); }
+    _audioHandlerService.dispose();
+    super.dispose();
   }
 
   Future<void> _initPermissionsAndAudio() async {
@@ -120,13 +139,13 @@ class _PTTHomePageState extends State<PTTHomePage> {
     if (_isMicPermissionGranted) {
       await _initializeAnotherRecorder();
     } else {
-      if(mounted) _showMessage("Permiso de Micrófono denegado. Grabación PTT no disponible.", isError: true, durationSeconds: 5);
+      if(mounted) showAppMessage(context, "Permiso de Micrófono denegado. Grabación PTT no disponible.", isError: true, durationSeconds: 5);
     }
   }
 
   Future<void> _initializeAnotherRecorder() async {
     if (!_isMicPermissionGranted) {
-      setState(() => _isAnotherRecorderReady = false);
+      if(mounted) setState(() => _isAnotherRecorderReady = false);
       return;
     }
     try {
@@ -157,8 +176,8 @@ class _PTTHomePageState extends State<PTTHomePage> {
       }
     } catch (e) {
       if (kDebugMode) print("ERROR: Inicializando AnotherAudioRecorder: $e");
-      if (mounted) _showMessage("Error al inicializar grabador (AAR): $e", isError: true);
-      setState(() => _isAnotherRecorderReady = false);
+      if (mounted) showAppMessage(context, "Error al inicializar grabador (AAR): $e", isError: true);
+      if(mounted) setState(() => _isAnotherRecorderReady = false);
     }
   }
 
@@ -178,7 +197,7 @@ class _PTTHomePageState extends State<PTTHomePage> {
       if (!_isAnotherRecorderReady) {
         if (mounted && _emisorPttStatus == EmisorLocalPttStatus.transmitting) {
           channel?.sink.add(jsonEncode({"type": "stop_transmit"}));
-          setState(() => _emisorPttStatus = EmisorLocalPttStatus.idle);
+          if(mounted) setState(() => _emisorPttStatus = EmisorLocalPttStatus.idle);
         }
         return;
       }
@@ -206,7 +225,7 @@ class _PTTHomePageState extends State<PTTHomePage> {
     } catch (e) {
       if (kDebugMode) print("ERROR: Iniciando grabación AAR: $e");
       if (mounted) {
-        _showMessage("Error al iniciar grabación (AAR): $e", isError: true);
+        showAppMessage(context, "Error al iniciar grabación (AAR): $e", isError: true);
         if (_emisorPttStatus == EmisorLocalPttStatus.transmitting) {
           channel?.sink.add(jsonEncode({"type": "stop_transmit"}));
         }
@@ -233,19 +252,19 @@ class _PTTHomePageState extends State<PTTHomePage> {
         if (await io.File(filePath).length() > 0) {
           return filePath;
         } else {
-          if(mounted) _showMessage("Error: Archivo de grabación está vacío.", isError: true);
+          if(mounted) showAppMessage(context, "Error: Archivo de grabación está vacío.", isError: true);
           return null;
         }
       } else {
         if (_completeRecordingPath != null && await io.File(_completeRecordingPath!).exists() && (await io.File(_completeRecordingPath!).length() > 0)) {
           return _completeRecordingPath;
         }
-        if(mounted) _showMessage("Error: Archivo de grabación no encontrado tras detener.", isError: true);
+        if(mounted) showAppMessage(context, "Error: Archivo de grabación no encontrado tras detener.", isError: true);
         return null;
       }
     } catch (e) {
       if (kDebugMode) print("ERROR: Deteniendo grabación AAR: $e");
-      if(mounted) _showMessage("Error al detener grabación (AAR): $e", isError: true);
+      if(mounted) showAppMessage(context, "Error al detener grabación (AAR): $e", isError: true);
       return null;
     }
   }
@@ -261,13 +280,13 @@ class _PTTHomePageState extends State<PTTHomePage> {
     try {
       io.File audioFile = io.File(filePath);
       if (!await audioFile.exists()) {
-        if(mounted) _showMessage("Error interno: Archivo de grabación no existe para envío.", isError: true);
+        if(mounted) showAppMessage(context, "Error interno: Archivo de grabación no existe para envío.", isError: true);
         channel!.sink.add(jsonEncode({"type": "stop_transmit"}));
         return;
       }
       final Uint8List fileBytes = await audioFile.readAsBytes();
       if (fileBytes.isEmpty) {
-        if(mounted) _showMessage("Error: Grabación resultó vacía, no se enviará.", isError: true);
+        if(mounted) showAppMessage(context, "Error: Grabación resultó vacía, no se enviará.", isError: true);
         channel!.sink.add(jsonEncode({"type": "stop_transmit"}));
         return;
       }
@@ -286,7 +305,7 @@ class _PTTHomePageState extends State<PTTHomePage> {
       }
     } catch (e) {
       if (kDebugMode) print("ERROR: Enviando audio: $e");
-      if(mounted) _showMessage("Error al enviar audio: $e", isError: true);
+      if(mounted) showAppMessage(context, "Error al enviar audio: $e", isError: true);
     } finally {
       if (connected && channel != null) {
         channel!.sink.add(jsonEncode({"type": "stop_transmit"}));
@@ -295,7 +314,13 @@ class _PTTHomePageState extends State<PTTHomePage> {
   }
 
   void _connect() {
-    bool canAttemptConnect = username.trim().isNotEmpty &&
+    if (mounted) {
+      setState(() {
+        username = _usernameController.text.trim();
+      });
+    }
+
+    bool canAttemptConnect = username.isNotEmpty &&
         selectedServer != null &&
         selectedServer!.isNotEmpty &&
         _isAudioHandlerServiceReady &&
@@ -303,16 +328,19 @@ class _PTTHomePageState extends State<PTTHomePage> {
         !connected;
 
     if ((!_isMicPermissionGranted && kReleaseMode) && !_isAnotherRecorderReady) {
-      _showMessage("Permiso de Micrófono y grabador no listos.", isError: true); return;
+      showAppMessage(context, "Permiso de Micrófono y grabador no listos.", isError: true); return;
     }
     if (!_isMicPermissionGranted && kReleaseMode) {
-      _showMessage("Permiso de Micrófono es necesario para grabar.", isError: true); return;
+      showAppMessage(context, "Permiso de Micrófono es necesario para grabar.", isError: true); return;
     }
     if (!_isAnotherRecorderReady) {
-      _showMessage("El sistema de grabación (AAR) no está listo. Intenta de nuevo.", isError: true); return;
+      showAppMessage(context, "El sistema de grabación (AAR) no está listo. Intenta de nuevo.", isError: true); return;
     }
 
-    if (!canAttemptConnect) return;
+    if (!canAttemptConnect) {
+      if(username.isEmpty && mounted) showAppMessage(context, "Por favor, ingresa tu nombre.", isError: true);
+      return;
+    }
 
     final url = "$selectedServer/$clientId/$username";
     try {
@@ -324,13 +352,13 @@ class _PTTHomePageState extends State<PTTHomePage> {
           _isAudioMessageCurrentlyPlaying = false; _idOfMessageCurrentlyPlaying = null; _currentPlaybackFinishedOrError = true;
         });
       }
-      _showMessage("Conectado como '$username'", durationSeconds: 2);
+      showAppMessage(context, "Conectado como '$username'", durationSeconds: 2);
 
       _websocketSubscription = channel!.stream.listen(
             (message) { if (!mounted) return; _handleServerMessage(message); },
         onDone: () {
           if (!mounted || channel == null) return;
-          _showMessage("Desconexión del servidor.", isError: true);
+          showAppMessage(context, "Desconexión del servidor.", isError: true);
           _audioHandlerService.stopCurrentMessagePlayback();
           if (_audioRecorderInstance != null && _currentRecorderStatus == RecordingStatus.Recording) { _stopRecording(); }
           if(mounted) { setState(() { connected = false; _emisorPttStatus = EmisorLocalPttStatus.idle; _currentGlobalTransmitterId = null; _currentGlobalTransmitterName = null; _lastReceivedMessageForAutoPlay = null; _isAudioMessageCurrentlyPlaying = false; _idOfMessageCurrentlyPlaying = null; _currentPlaybackFinishedOrError = true; }); }
@@ -338,7 +366,7 @@ class _PTTHomePageState extends State<PTTHomePage> {
         onError: (error) {
           if (kDebugMode) print("ERROR: WebSocket: $error");
           if (!mounted || channel == null) return;
-          _showMessage("Error de conexión: $error", isError: true);
+          showAppMessage(context, "Error de conexión: $error", isError: true);
           _audioHandlerService.stopCurrentMessagePlayback();
           if (_audioRecorderInstance != null && _currentRecorderStatus == RecordingStatus.Recording) { _stopRecording(); }
           if(mounted) { setState(() { connected = false; _emisorPttStatus = EmisorLocalPttStatus.idle; _currentGlobalTransmitterId = null; _currentGlobalTransmitterName = null; _lastReceivedMessageForAutoPlay = null; _isAudioMessageCurrentlyPlaying = false; _idOfMessageCurrentlyPlaying = null; _currentPlaybackFinishedOrError = true; }); }
@@ -346,46 +374,100 @@ class _PTTHomePageState extends State<PTTHomePage> {
       );
     } catch (e) {
       if (kDebugMode) print("ERROR: Conectando WebSocket: $e");
-      _showMessage("Excepción al conectar: $e", isError: true);
+      showAppMessage(context, "Excepción al conectar: $e", isError: true);
       if(mounted) setState(() { connected = false; });
     }
   }
 
-  void _disconnect() {
+  Future<void> _disconnect() async {
     if (!connected && channel == null) return;
-    if (_audioRecorderInstance != null && _currentRecorderStatus == RecordingStatus.Recording) {
-      _stopRecording().catchError((e) { if (kDebugMode) print("WARN: Error deteniendo grabador en disconnect: $e"); });
+
+    final bool? confirmDisconnect = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (BuildContext dialogContext) {
+        return AlertDialog(
+          title: Text('Confirmar Desconexión'),
+          content: Text('¿Estás seguro de que quieres desconectarte?'),
+          actions: <Widget>[
+            TextButton(
+              child: Text('Cancelar'),
+              onPressed: () {
+                Navigator.of(dialogContext).pop(false);
+              },
+            ),
+            TextButton(
+              child: Text('Desconectar', style: TextStyle(color: Theme.of(dialogContext).colorScheme.error)),
+              onPressed: () {
+                Navigator.of(dialogContext).pop(true);
+              },
+            ),
+          ],
+        );
+      },
+    );
+
+    if (confirmDisconnect == true) {
+      if (_audioRecorderInstance != null && _currentRecorderStatus == RecordingStatus.Recording) {
+        _stopRecording().catchError((e) { if (kDebugMode) print("WARN: Error deteniendo grabador en disconnect: $e"); });
+      }
+      _audioHandlerService.stopCurrentMessagePlayback();
+      if (mounted) {
+        setState(() {
+          connected = false;
+          _emisorPttStatus = EmisorLocalPttStatus.idle;
+          _currentGlobalTransmitterId = null;
+          _currentGlobalTransmitterName = null;
+          _lastReceivedMessageForAutoPlay = null;
+          _isAudioMessageCurrentlyPlaying = false;
+          _idOfMessageCurrentlyPlaying = null;
+          _currentPlaybackFinishedOrError = true;
+        });
+      }
+      showAppMessage(context, "Desconectando...", durationSeconds: 1);
+      _websocketSubscription?.cancel(); _websocketSubscription = null;
+      channel?.sink.close().catchError((e) {/* ignorar */}); channel = null;
     }
-    _audioHandlerService.stopCurrentMessagePlayback();
-    if (mounted) {
+  }
+
+  void _handleAddNewServer() {
+    showAddServerDialog(
+        context: context,
+        showMessageCallback: (msg, {isError = false}) {
+          showAppMessage(context, msg, isError: isError);
+        },
+        onServerAdded: (newUrl) {
+          if (!servers.contains(newUrl)) {
+            if (mounted) {
+              setState(() {
+                servers.add(newUrl);
+                selectedServer = newUrl;
+              });
+            }
+            showAppMessage(context, "Servidor '$newUrl' añadido.");
+          } else {
+            showAppMessage(context, "Servidor ya existe.", isError: true);
+          }
+        }
+    );
+  }
+
+  void _handleRemoveServer(String urlToRemove) {
+    final result = prepareServerRemoval(
+        currentServers: servers,
+        currentSelectedServer: selectedServer,
+        urlToRemove: urlToRemove,
+        showMessageCallback: (msg, {isError = false}) {
+          showAppMessage(context, msg, isError: isError);
+        }
+    );
+
+    if (result['removed'] == true && mounted) {
       setState(() {
-        connected = false; _emisorPttStatus = EmisorLocalPttStatus.idle; _currentGlobalTransmitterId = null;
-        _currentGlobalTransmitterName = null; _lastReceivedMessageForAutoPlay = null;
-        _isAudioMessageCurrentlyPlaying = false; _idOfMessageCurrentlyPlaying = null; _currentPlaybackFinishedOrError = true;
+        servers = result['servers'];
+        selectedServer = result['selectedServer'];
       });
     }
-    _showMessage("Desconectando...", durationSeconds: 1);
-    _websocketSubscription?.cancel(); _websocketSubscription = null;
-    channel?.sink.close().catchError((e) {/* ignorar */}); channel = null;
-  }
-
-  void _showMessage(String msg, {bool isError = false, int? durationSeconds}) {
-    if (mounted) {
-      ScaffoldMessenger.of(context).removeCurrentSnackBar();
-      ScaffoldMessenger.of(context).showSnackBar( SnackBar( content: Text(msg), duration: Duration(seconds: durationSeconds ?? (isError ? 4 : 2)), backgroundColor: isError ? Colors.red.shade700 : Colors.teal.shade700, behavior: SnackBarBehavior.floating ) );
-    }
-  }
-
-  void _addServer() {
-    showDialog(context: context, builder: (context) {
-      final controller = TextEditingController();
-      return AlertDialog( title: Text("Agregar Servidor"), content: TextField(controller: controller, decoration: InputDecoration(hintText: "ws://ip:puerto/ws"), keyboardType: TextInputType.url), actions: [ TextButton(onPressed: () { final url = controller.text.trim(); if (url.isNotEmpty && (url.startsWith("ws://") || url.startsWith("wss://"))) { if (!servers.contains(url)) { if (mounted) setState(() { servers.add(url); selectedServer = url; }); _showMessage("Servidor '$url' añadido."); } else { _showMessage("Servidor ya existe.", isError: true); } } else { _showMessage("URL inválida.", isError: true); } Navigator.pop(context); }, child: Text("Agregar")), TextButton(onPressed: () => Navigator.pop(context), child: Text("Cancelar")), ], ); });
-  }
-
-  void _removeServer(String url) {
-    if (servers.length <= 1 && servers.contains(url)) { _showMessage("No puedes eliminar el único servidor.", isError: true); return; }
-    if (mounted) { setState(() { servers.remove(url); if (selectedServer == url) selectedServer = servers.isNotEmpty ? servers.first : null; }); }
-    _showMessage("Servidor '$url' eliminado.");
   }
 
   void _handleServerMessage(dynamic rawMessage) async {
@@ -397,19 +479,19 @@ class _PTTHomePageState extends State<PTTHomePage> {
       switch (type) {
         case 'transmit_approved':
           if (mounted && _emisorPttStatus == EmisorLocalPttStatus.requesting) {
-            setState(() => _emisorPttStatus = EmisorLocalPttStatus.transmitting );
+            if(mounted) setState(() => _emisorPttStatus = EmisorLocalPttStatus.transmitting );
             Future.delayed(Duration(milliseconds: 50), () async {
               if (!mounted || _emisorPttStatus != EmisorLocalPttStatus.transmitting) return;
               await _playLocalBeepInicio();
               await _startRecording();
-              if (mounted) _showMessage("Grabando...", durationSeconds: 2);
+              if (mounted) showAppMessage(context, "Grabando...", durationSeconds: 2);
             });
           }
           break;
         case 'transmit_denied':
-          _showMessage("No puedes enviar: ${data['reason']}", isError: true);
+          showAppMessage(context, "No puedes enviar: ${data['reason']}", isError: true);
           if(mounted && _emisorPttStatus == EmisorLocalPttStatus.requesting) {
-            setState(() { _emisorPttStatus = EmisorLocalPttStatus.idle; });
+            if(mounted) setState(() { _emisorPttStatus = EmisorLocalPttStatus.idle; });
             await _playLocalBeepFin();
           }
           break;
@@ -423,14 +505,14 @@ class _PTTHomePageState extends State<PTTHomePage> {
             setState(() { _currentGlobalTransmitterId = tId; _currentGlobalTransmitterName = tName ?? 'Desconocido'; });
             if (isMe) {
               if (_emisorPttStatus == EmisorLocalPttStatus.transmitting) {
-                _showMessage("Canal abierto. Estás grabando.", durationSeconds: 2);
+                showAppMessage(context, "Canal abierto. Estás grabando.", durationSeconds: 2);
               } else {
                 if(mounted) setState(() => _emisorPttStatus = EmisorLocalPttStatus.transmitting);
-                _showMessage("Canal abierto (estado local corregido).", durationSeconds: 2);
+                showAppMessage(context, "Canal abierto (estado local corregido).", durationSeconds: 2);
               }
             } else {
-              _showMessage("${tName ?? 'Alguien'} está grabando...", durationSeconds: 2);
-              if (prevId == null && !_isAudioMessageCurrentlyPlaying) { // Solo sonar beep si el canal estaba libre y no hay nada sonando
+              showAppMessage(context, "${tName ?? 'Alguien'} está grabando...", durationSeconds: 2);
+              if (prevId == null && !_isAudioMessageCurrentlyPlaying) {
                 await _playLocalBeepInicio();
               }
             }
@@ -444,15 +526,15 @@ class _PTTHomePageState extends State<PTTHomePage> {
 
           if (mounted) {
             if (_currentGlobalTransmitterId == sId) {
-              setState(() { _currentGlobalTransmitterId = null; _currentGlobalTransmitterName = null; });
+              if(mounted) setState(() { _currentGlobalTransmitterId = null; _currentGlobalTransmitterName = null; });
             }
             if (wasMe && (_emisorPttStatus == EmisorLocalPttStatus.transmitting || _emisorPttStatus == EmisorLocalPttStatus.requesting)) {
-              setState(() { _emisorPttStatus = EmisorLocalPttStatus.idle; });
+              if(mounted) setState(() { _emisorPttStatus = EmisorLocalPttStatus.idle; });
             }
           }
 
           if (wasOther) {
-            _showMessage("Grabación de ${sName ?? 'alguien'} finalizada.", durationSeconds: 1);
+            showAppMessage(context, "Grabación de ${sName ?? 'alguien'} finalizada.", durationSeconds: 1);
             final bool isCurrentlyPlayingAudioFromThisSender =
                 _isAudioMessageCurrentlyPlaying &&
                     _idOfMessageCurrentlyPlaying != null &&
@@ -463,7 +545,7 @@ class _PTTHomePageState extends State<PTTHomePage> {
             }
           }
           else if (wasMe) {
-            _showMessage("Tu transmisión ha finalizado.", durationSeconds: 1);
+            showAppMessage(context, "Tu transmisión ha finalizado.", durationSeconds: 1);
           }
           break;
         case 'incoming_audio_message':
@@ -478,18 +560,22 @@ class _PTTHomePageState extends State<PTTHomePage> {
             if (mounted) {
               if (_isAudioMessageCurrentlyPlaying && _idOfMessageCurrentlyPlaying != newMsg.id) {
                 await _audioHandlerService.stopCurrentMessagePlayback();
-                setState(() {
-                  if (_lastReceivedMessageForAutoPlay?.id == _idOfMessageCurrentlyPlaying) {
-                    if (_lastReceivedMessageForAutoPlay != null) _lastReceivedMessageForAutoPlay!.isPlaying = false;
-                  }
-                  _isAudioMessageCurrentlyPlaying = false; _idOfMessageCurrentlyPlaying = null;
-                  _currentPlaybackFinishedOrError = true;
-                });
+                if(mounted) {
+                  setState(() {
+                    if (_lastReceivedMessageForAutoPlay?.id == _idOfMessageCurrentlyPlaying) {
+                      if (_lastReceivedMessageForAutoPlay != null) _lastReceivedMessageForAutoPlay!.isPlaying = false;
+                    }
+                    _isAudioMessageCurrentlyPlaying = false; _idOfMessageCurrentlyPlaying = null;
+                    _currentPlaybackFinishedOrError = true;
+                  });
+                }
                 await Future.delayed(Duration(milliseconds: 150));
               }
-              setState(() { _lastReceivedMessageForAutoPlay = newMsg; _currentPlaybackFinishedOrError = false; });
+              if(mounted) {
+                setState(() { _lastReceivedMessageForAutoPlay = newMsg; _currentPlaybackFinishedOrError = false; });
+              }
               if (_lastReceivedMessageForAutoPlay != null) {
-                _showMessage("Audio de $suName. Reproduciendo...", durationSeconds: 2);
+                showAppMessage(context, "Audio de $suName. Reproduciendo...", durationSeconds: 2);
                 _downloadAndPlayReceivedAudio(_lastReceivedMessageForAutoPlay!);
               }
             }
@@ -514,11 +600,11 @@ class _PTTHomePageState extends State<PTTHomePage> {
 
     if (!canRequest) return;
     if (!_isMicPermissionGranted && kReleaseMode) {
-      _showMessage("Permiso de micrófono es necesario para grabar.", isError: true); return;
+      showAppMessage(context, "Permiso de micrófono es necesario para grabar.", isError: true); return;
     }
     if(mounted) setState(() { _emisorPttStatus = EmisorLocalPttStatus.requesting; });
     channel?.sink.add(jsonEncode({"type": "request_transmit"}));
-    _showMessage("Solicitando para grabar...", durationSeconds: 1);
+    showAppMessage(context, "Solicitando para grabar...", durationSeconds: 1);
   }
 
   Future<void> _onPttRelease() async {
@@ -526,13 +612,13 @@ class _PTTHomePageState extends State<PTTHomePage> {
 
     if (_emisorPttStatus == EmisorLocalPttStatus.transmitting) {
       final String? recordedFilePath = await _stopRecording();
-      if (mounted) await _playLocalBeepFin(); // Sonar beep de fin de transmisión propia
+      if (mounted) await _playLocalBeepFin();
       if (!mounted) return;
 
       if (recordedFilePath != null) {
         await _sendRecordedAudioFileAndNotifyStop(recordedFilePath);
       } else {
-        _showMessage("Error: No se pudo obtener archivo grabado.", isError: true);
+        showAppMessage(context, "Error: No se pudo obtener archivo grabado.", isError: true);
         if (connected && channel != null) {
           channel!.sink.add(jsonEncode({"type": "stop_transmit"}));
         }
@@ -540,8 +626,8 @@ class _PTTHomePageState extends State<PTTHomePage> {
     } else if (_emisorPttStatus == EmisorLocalPttStatus.requesting) {
       await _audioHandlerService.cancelCurrentBeep();
       if(mounted) setState(() { _emisorPttStatus = EmisorLocalPttStatus.idle; });
-      _showMessage("Solicitud cancelada.", durationSeconds: 1);
-      await _playLocalBeepFin(); // Sonar beep de cancelación
+      showAppMessage(context, "Solicitud cancelada.", durationSeconds: 1);
+      await _playLocalBeepFin();
     }
   }
 
@@ -549,7 +635,7 @@ class _PTTHomePageState extends State<PTTHomePage> {
     if (kDebugMode) print("DL_PLAY: Iniciando para msg ID ${msgToPlay.id}. URL: ${msgToPlay.url}");
 
     if (_appTempDirectoryPath == null) {
-      _showMessage("Directorio temporal no listo.", isError: true);
+      showAppMessage(context, "Directorio temporal no listo.", isError: true);
       if (kDebugMode) print("DL_PLAY_ERR: _appTempDirectoryPath es nulo para msg ID ${msgToPlay.id}.");
       if (mounted) setState(()=> _currentPlaybackFinishedOrError = true);
       return;
@@ -559,11 +645,13 @@ class _PTTHomePageState extends State<PTTHomePage> {
       channel!.sink.add(jsonEncode({ "type": "receiver_busy", "client_id": clientId, "message_id": msgToPlay.id }));
     }
 
-    if(mounted) setState(() {
-      msgToPlay.isDownloading = true; msgToPlay.hasError = false;
-      _isAudioMessageCurrentlyPlaying = true; _idOfMessageCurrentlyPlaying = msgToPlay.id;
-      _currentPlaybackFinishedOrError = false;
-    });
+    if(mounted) {
+      setState(() {
+        msgToPlay.isDownloading = true; msgToPlay.hasError = false;
+        _isAudioMessageCurrentlyPlaying = true; _idOfMessageCurrentlyPlaying = msgToPlay.id;
+        _currentPlaybackFinishedOrError = false;
+      });
+    }
 
     String localFileName = generateLocalFilenameForDownload(messageId: msgToPlay.id, originalFilename: msgToPlay.filename, tempFilenameBase: _tempAudioFilenameReceiverBase);
     String localFilePath = '${_appTempDirectoryPath!}/$localFileName';
@@ -604,7 +692,7 @@ class _PTTHomePageState extends State<PTTHomePage> {
               }
             },
             onError: (e) {
-              _showMessage("Error al reproducir: $e", isError: true);
+              showAppMessage(context, "Error al reproducir: $e", isError: true);
               if (mounted) {
                 setState(() {
                   msgToPlay.isPlaying = false; msgToPlay.hasError = true;
@@ -624,7 +712,7 @@ class _PTTHomePageState extends State<PTTHomePage> {
       }
     } catch (e, s) {
       if (kDebugMode) print("DL_PLAY_ERR: Excepción en _downloadAndPlayReceivedAudio para msg ID ${msgToPlay.id}: $e\nStackTrace: $s");
-      _showMessage("Error al descargar/procesar: $e", isError: true);
+      showAppMessage(context, "Error al descargar/procesar: $e", isError: true);
       if (mounted) {
         setState(() {
           msgToPlay.hasError = true;
@@ -653,29 +741,31 @@ class _PTTHomePageState extends State<PTTHomePage> {
   }
 
   @override
-  void dispose() {
-    if (_audioRecorderInstance != null && _currentRecorderStatus == RecordingStatus.Recording ) {
-      _audioRecorderInstance!.stop().catchError((e){ if (kDebugMode) print("WARN: Error deteniendo AAR en dispose: $e");});
-    }
-    _audioRecorderInstance = null;
-
-    _audioHandlerService.stopCurrentMessagePlayback();
-    _websocketSubscription?.cancel();
-    if(channel != null) { channel!.sink.close().catchError((e){/* ignorar */}); }
-    _audioHandlerService.dispose();
-    super.dispose();
-  }
-
-  @override
   Widget build(BuildContext context) {
-    String pttButtonText = ""; Color pttButtonColor = Colors.grey; IconData pttIcon = Icons.mic;
-    bool pttButtonEnabled = false; String channelStatusText = "CANAL LIBRE"; Color channelStatusColor = Colors.green;
+    String pttButtonText = "";
+    Color pttButtonColorValue;
+    IconData pttIcon = Icons.mic;
+    bool pttButtonEnabled = false;
+    String channelStatusText = "CANAL LIBRE";
+    Color channelStatusColorValue;
+
+    Color appBarDynamicColorValue = appBarBackgroundColor;
+
+    bool isActuallyRecording = _emisorPttStatus == EmisorLocalPttStatus.transmitting &&
+        _currentRecorderStatus == RecordingStatus.Recording &&
+        connected;
+
+    if (isActuallyRecording) {
+      appBarDynamicColorValue = pttButtonRecordingColor;
+    } else if (connected && _currentGlobalTransmitterId != null && _currentGlobalTransmitterId != clientId) {
+      appBarDynamicColorValue = channelStatusOtherRecordingColor;
+    }
 
     bool micAndServicesReady = _isMicPermissionGranted &&
         _isAudioHandlerServiceReady &&
         _isAnotherRecorderReady;
 
-    bool canConnectButtonEnabled = username.trim().isNotEmpty &&
+    bool canConnectButtonEnabled = _usernameController.text.trim().isNotEmpty &&
         selectedServer != null &&
         selectedServer!.isNotEmpty &&
         _isAudioHandlerServiceReady &&
@@ -688,81 +778,172 @@ class _PTTHomePageState extends State<PTTHomePage> {
       if (_currentGlobalTransmitterId != null) {
         if (_currentGlobalTransmitterId == clientId) {
           channelStatusText = _emisorPttStatus == EmisorLocalPttStatus.transmitting ? "TÚ ESTÁS GRABANDO" : "TÚ ENVIASTE AUDIO";
-          channelStatusColor = Colors.redAccent.shade700;
-        }
-        else {
+          channelStatusColorValue = channelStatusOtherRecordingColor;
+        } else {
           channelStatusText = "EN CANAL: ${_currentGlobalTransmitterName ?? 'Desconocido'}";
-          channelStatusColor = Colors.orange.shade700;
+          channelStatusColorValue = channelStatusOtherRecordingColor;
         }
       } else if (_isAudioMessageCurrentlyPlaying && _idOfMessageCurrentlyPlaying != null && _lastReceivedMessageForAutoPlay?.id == _idOfMessageCurrentlyPlaying) {
-
         channelStatusText = "REPRODUCIENDO DE: ${_lastReceivedMessageForAutoPlay!.senderUsername}";
-        channelStatusColor = Colors.purple.shade400;
+        channelStatusColorValue = channelStatusPlayingAudioColor;
+      } else {
+        channelStatusColorValue = channelStatusFreeColor;
       }
-
+    } else {
+      channelStatusColorValue = channelStatusFreeColor;
     }
 
-
     if (!connected) {
-      // No se muestra el botón PTT si no está conectado
+      pttButtonColorValue = pttButtonDisabledColor;
     } else if (!_isMicPermissionGranted && kReleaseMode) {
-      pttButtonText = "PERMISO MIC"; pttIcon = Icons.mic_off_rounded; pttButtonColor = Colors.red.shade300; pttButtonEnabled = false;
+      pttButtonText = "PERMISO MIC"; pttIcon = Icons.mic_off_rounded;
+      pttButtonColorValue = pttButtonDisabledColor;
+      pttButtonEnabled = false;
     } else if (!micAndServicesReady) {
-      pttButtonText = "AUDIO/REC NO LISTO"; pttIcon = Icons.settings_voice_rounded; pttButtonColor = Colors.blueGrey.shade300; pttButtonEnabled = false;
+      pttButtonText = "AUDIO/REC NO LISTO"; pttIcon = Icons.settings_voice_rounded;
+      pttButtonColorValue = pttButtonDisabledColor;
+      pttButtonEnabled = false;
     } else {
       if (_isAudioMessageCurrentlyPlaying && _idOfMessageCurrentlyPlaying != null && !_currentPlaybackFinishedOrError) {
         pttButtonText = "REPRODUCIENDO..."; pttIcon = Icons.play_circle_fill_rounded;
-        pttButtonColor = Colors.purple.shade300; pttButtonEnabled = false;
-      }
-      else if (_currentGlobalTransmitterId != null && _currentGlobalTransmitterId != clientId) {
+        pttButtonColorValue = appAccentColor.withAlpha(200);
+        pttButtonEnabled = false;
+      } else if (_currentGlobalTransmitterId != null && _currentGlobalTransmitterId != clientId) {
         pttButtonText = "${_currentGlobalTransmitterName ?? 'Alguien'} GRABA"; pttIcon = Icons.hearing_rounded;
-        pttButtonColor = Colors.orangeAccent.shade700; pttButtonEnabled = false;
-      }
-      else if (_emisorPttStatus == EmisorLocalPttStatus.requesting) {
-        pttButtonText = "SOLICITANDO..."; pttIcon = Icons.timer_outlined; pttButtonColor = Colors.blueGrey; pttButtonEnabled = true;
+        pttButtonColorValue = channelStatusOtherRecordingColor;
+        pttButtonEnabled = false;
+      } else if (_emisorPttStatus == EmisorLocalPttStatus.requesting) {
+        pttButtonText = "SOLICITANDO..."; pttIcon = Icons.timer_outlined;
+        pttButtonColorValue = pttButtonRequestingColor;
+        pttButtonEnabled = true;
       } else if (_emisorPttStatus == EmisorLocalPttStatus.transmitting) {
         if (_currentRecorderStatus == RecordingStatus.Recording) {
-          pttButtonText = "GRABANDO... SUELTA"; pttIcon = Icons.mic_external_on_rounded; pttButtonColor = Colors.redAccent.shade700;
-        } else { // Aún no ha empezado a grabar pero está en transmitting (esperando beep y startRecording)
-          pttButtonText = "INICIANDO GRAB..."; pttIcon = Icons.mic_none_rounded; pttButtonColor = Colors.orange.shade400;
+          pttButtonText = "GRABANDO... SUELTA"; pttIcon = Icons.mic_external_on_rounded;
+          pttButtonColorValue = pttButtonRecordingColor;
+        } else {
+          pttButtonText = "INICIANDO GRAB..."; pttIcon = Icons.mic_none_rounded;
+          pttButtonColorValue = pttButtonRequestingColor;
         }
         pttButtonEnabled = true;
-      } else { // idle
-        pttButtonText = "PULSA PARA GRABAR"; pttIcon = Icons.mic_rounded; pttButtonColor = Colors.green.shade700; pttButtonEnabled = true;
+      } else {
+        pttButtonText = "PULSA PARA GRABAR"; pttIcon = Icons.mic_rounded;
+        pttButtonColorValue = pttButtonReadyColor;
+        pttButtonEnabled = true;
       }
     }
 
+    Color currentPttIconAndTextColor = pttButtonTextColor;
+
     return Scaffold(
-      appBar: AppBar(title: Text("PTT App ${username.isNotEmpty ? '($username)' : ''}")),
+      appBar: AppBar(
+        title: SizedBox(
+          height: kToolbarHeight - 16,
+          child: Image.asset(
+            'assets/logo.png',
+            fit: BoxFit.contain,
+          ),
+        ),
+        centerTitle: true,
+        backgroundColor: appBarDynamicColorValue,
+        actions: [
+          if (connected)
+            IconButton(
+              icon: Icon(Icons.logout_rounded),
+              tooltip: 'Desconectar',
+              onPressed: _disconnect,
+            ),
+        ],
+      ),
       body: Padding(
         padding: const EdgeInsets.all(16.0),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             if (!connected) ...[
-              TextField(decoration: InputDecoration(labelText: "Tu Nombre", border: OutlineInputBorder(), prefixIcon: Icon(Icons.person_outline)), onChanged: (val) { if(mounted) setState(() => username = val.trim()); }, enabled: !connected ),
-              SizedBox(height: 8), Text("Servidor:", style: Theme.of(context).textTheme.bodySmall),
-              Row(children: [ Expanded(child: DropdownButtonHideUnderline(child: Container( padding: EdgeInsets.symmetric(horizontal: 10.0, vertical: 4.0), decoration: BoxDecoration(borderRadius: BorderRadius.circular(8.0), border: Border.all(color: Theme.of(context).colorScheme.outline.withOpacity(0.7), width: 1)), child: DropdownButton<String>( value: selectedServer, items: servers.isEmpty ? [DropdownMenuItem(value: null, enabled: false, child: Text("Añade un servidor"))] : servers.map((s) => DropdownMenuItem(value: s, child: Row( children: [ Flexible(child: Text(s, overflow: TextOverflow.ellipsis)), if (!(servers.length == 1 && selectedServer == s)) IconButton(icon: Icon(Icons.delete_outline_rounded, size: 20), onPressed: () => _removeServer(s), padding: EdgeInsets.zero, constraints: BoxConstraints()) ], ))).toList(), onChanged: (val) { if (mounted) setState(() { selectedServer = val; }); }, isExpanded: true, hint: Text("Selecciona servidor"), underline: SizedBox.shrink(), borderRadius: BorderRadius.circular(8.0) ) ))), IconButton(icon: Icon(Icons.add_circle_outline_rounded), tooltip: "Añadir servidor", onPressed: _addServer) ]),
+              TextField(
+                  controller: _usernameController,
+                  decoration: InputDecoration(
+                      labelText: "Tu Nombre",
+                      prefixIcon: Icon(Icons.person_outline)
+                  ),
+                  onChanged: (val) {
+                    if(mounted) setState(() {});
+                  },
+                  enabled: !connected
+              ),
+              SizedBox(height: 8),
+              Text("Servidor:", style: Theme.of(context).textTheme.bodySmall),
+              Row(children: [
+                Expanded(child: Container(
+                    padding: EdgeInsets.symmetric(horizontal: 10.0),
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(8.0),
+                      border: Border.all(color: Theme.of(context).dividerColor, width: 1),
+                      color: Theme.of(context).colorScheme.surface,
+                    ),
+                    child: DropdownButtonHideUnderline(
+                        child: DropdownButton<String>(
+                          value: selectedServer,
+                          items: servers.isEmpty
+                              ? [DropdownMenuItem(value: null, enabled: false, child: Text("Añade un servidor", style: TextStyle(color: Theme.of(context).hintColor.withOpacity(0.6))))]
+                              : servers.map((s) => DropdownMenuItem(
+                              value: s,
+                              child: Row( children: [
+                                Flexible(child: Text(s, overflow: TextOverflow.ellipsis)),
+                                if (!(servers.length == 1 && selectedServer == s))
+                                  IconButton(
+                                      icon: Icon(Icons.delete_outline_rounded, size: 20, color: Theme.of(context).iconTheme.color?.withOpacity(0.7)),
+                                      onPressed: () => _handleRemoveServer(s),
+                                      padding: EdgeInsets.zero,
+                                      constraints: BoxConstraints()
+                                  )
+                              ], ))
+                          ).toList(),
+                          onChanged: (val) { if (mounted) setState(() { selectedServer = val; }); },
+                          isExpanded: true,
+                          hint: Text("Selecciona servidor", style: TextStyle(color: Theme.of(context).hintColor.withOpacity(0.6))),
+                          borderRadius: BorderRadius.circular(8.0),
+                          dropdownColor: Theme.of(context).colorScheme.surface,
+                          iconEnabledColor: Theme.of(context).iconTheme.color,
+                          style: Theme.of(context).textTheme.bodyMedium,
+                        )
+                    )
+                )),
+                IconButton(
+                    icon: Icon(Icons.add_circle_outline_rounded, color: Colors.white,),
+                    tooltip: "Añadir servidor",
+                    onPressed: _handleAddNewServer
+                )
+              ]),
               SizedBox(height: 12),
               ElevatedButton.icon(
-                  icon: Icon(Icons.login_rounded),
+                  icon: Icon(Icons.login_rounded, color: Colors.white,),
                   onPressed: canConnectButtonEnabled ? _connect : null,
                   label: Text("CONECTAR"),
-                  style: ElevatedButton.styleFrom(backgroundColor: Colors.orange, padding: EdgeInsets.symmetric(vertical: 14))
+                  style: ElevatedButton.styleFrom(
+                    foregroundColor: canConnectButtonEnabled ? textOnPrimaryColor : hintTextColor.withOpacity(0.7),
+                    backgroundColor: canConnectButtonEnabled ? appPrimaryColor : appAccentColor.withOpacity(0.3),
+                  )
               ),
               if (!micAndServicesReady && mounted)
                 Padding(
                     padding: const EdgeInsets.only(top:8.0),
                     child: Text(
-                        (!_isMicPermissionGranted && kReleaseMode) ? "Permiso de Micrófono necesario." : (!_isAudioHandlerServiceReady ? "Sistema de Audio no listo..." : (!_isAnotherRecorderReady ? "Sistema de Grabación (AAR) no listo..." : "Servicios no listos.")),
+                        ((!_isMicPermissionGranted && kReleaseMode) ? "Permiso de Micrófono necesario." : (!_isAudioHandlerServiceReady ? "Sistema de Audio no listo..." : (!_isAnotherRecorderReady ? "Sistema de Grabación (AAR) no listo..." : "Servicios no listos."))),
                         textAlign: TextAlign.center,
-                        style: TextStyle(fontSize: 10, color: Colors.grey.shade600)
+                        style: TextStyle(fontSize: 10, color: Theme.of(context).hintColor.withOpacity(0.7))
                     )
                 ),
             ] else ...[
-              Text("Conectado: $username", textAlign: TextAlign.center, style: TextStyle(fontWeight: FontWeight.bold)),
-              Padding( padding: const EdgeInsets.symmetric(vertical: 4.0), child: Text( channelStatusText, textAlign: TextAlign.center, style: TextStyle(color: channelStatusColor, fontStyle: FontStyle.italic, fontWeight: FontWeight.bold ) ) ),
-              SizedBox(height: 8), ElevatedButton.icon( icon: Icon(Icons.logout_rounded), onPressed: _disconnect, label: Text("DESCONECTAR"), style: ElevatedButton.styleFrom(backgroundColor: Colors.blueGrey, padding: EdgeInsets.symmetric(vertical: 10)) ),
+              Text("Conectado como: $username",
+                  textAlign: TextAlign.center,
+                  style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.bold)
+              ),
+              Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 4.0),
+                  child: Text( channelStatusText, textAlign: TextAlign.center, style: TextStyle(color: channelStatusColorValue, fontStyle: FontStyle.italic, fontWeight: FontWeight.bold ) )
+              ),
+              SizedBox(height: 8),
             ],
             Divider(height: 20, thickness: 1),
             Expanded(
@@ -776,33 +957,57 @@ class _PTTHomePageState extends State<PTTHomePage> {
                     onTapUp: pttButtonEnabled ? (_) => _onPttRelease() : null,
                     onLongPressStart: pttButtonEnabled ? (_) => _onPttPress() : null,
                     onLongPressEnd: pttButtonEnabled ? (_) => _onPttRelease() : null,
-                    onLongPressCancel: pttButtonEnabled ? () => _onPttRelease() : null, // Para cuando se desliza fuera
+                    onLongPressCancel: pttButtonEnabled ? () => _onPttRelease() : null,
                     child: AnimatedContainer(
                         duration: Duration(milliseconds: 150),
                         padding: EdgeInsets.all(25),
                         constraints: BoxConstraints(minWidth: 140, minHeight: 140, maxWidth: 180, maxHeight: 180),
                         decoration: BoxDecoration(
-                          color: pttButtonColor, shape: BoxShape.circle,
-                          boxShadow: [ if(pttButtonEnabled && !( _isAudioMessageCurrentlyPlaying && !_currentPlaybackFinishedOrError ) )
-                            BoxShadow(color: pttButtonColor.withOpacity(0.5), blurRadius: 10, spreadRadius: 3)
+                          color: pttButtonColorValue,
+                          shape: BoxShape.circle,
+                          boxShadow: [
+                            if(pttButtonEnabled && !( _isAudioMessageCurrentlyPlaying && !_currentPlaybackFinishedOrError ) )
+                              BoxShadow(
+                                  color: pttButtonColorValue.withOpacity(0.4),
+                                  blurRadius: _emisorPttStatus == EmisorLocalPttStatus.transmitting ? 15 : 10,
+                                  spreadRadius: _emisorPttStatus == EmisorLocalPttStatus.transmitting ? 5 : 3
+                              )
                           ],
                           border: _isAudioMessageCurrentlyPlaying && !_currentPlaybackFinishedOrError
-                              ? Border.all(color: Colors.white54, width: 2)
+                              ? Border.all(color: generalTextColor.withOpacity(0.7), width: 2)
                               : null,
                         ),
                         child: Column( mainAxisSize: MainAxisSize.min, mainAxisAlignment: MainAxisAlignment.center,
-                          children: [ Icon(pttIcon, size: 40, color: Colors.white), SizedBox(height: 5), Container( width: 90, child: Text( pttButtonText, style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 11), textAlign: TextAlign.center, maxLines: 2, overflow: TextOverflow.ellipsis ) ) ],
+                          children: [
+                            Icon(pttIcon, size: 40, color: currentPttIconAndTextColor),
+                            SizedBox(height: 5),
+                            Container(
+                                width: 90,
+                                child: Text(
+                                    pttButtonText,
+                                    style: TextStyle(color: currentPttIconAndTextColor, fontWeight: FontWeight.bold, fontSize: 11),
+                                    textAlign: TextAlign.center, maxLines: 2, overflow: TextOverflow.ellipsis
+                                )
+                            )
+                          ],
                         )
                     ),
                   ),
                   if (_lastReceivedMessageForAutoPlay != null && _lastReceivedMessageForAutoPlay!.hasError && _currentPlaybackFinishedOrError)
                     Padding(
                       padding: const EdgeInsets.only(top: 20.0),
-                      child: Text("Error al reproducir el último audio.", style: TextStyle(color: Colors.redAccent, fontStyle: FontStyle.italic)),
+                      child: Text(
+                          "Error al reproducir el último audio.",
+                          style: TextStyle(color: Theme.of(context).colorScheme.error, fontStyle: FontStyle.italic)
+                      ),
                     )
                 ],
               )
-                  : Center(child: Text( !_isMicPermissionGranted && kReleaseMode ? "Permiso de micrófono es necesario." : "Conéctate para usar la función PTT.", textAlign: TextAlign.center, style: TextStyle(color: Colors.grey.shade700))),
+                  : Center(child: Text(
+                  !_isMicPermissionGranted && kReleaseMode ? "Permiso de micrófono es necesario." : "Conéctate para usar la función PTT.",
+                  textAlign: TextAlign.center,
+                  style: TextStyle(color: Theme.of(context).hintColor.withOpacity(0.7))
+              )),
             ),
           ],
         ),
@@ -810,3 +1015,4 @@ class _PTTHomePageState extends State<PTTHomePage> {
     );
   }
 }
+
